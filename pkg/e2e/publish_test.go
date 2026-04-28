@@ -36,11 +36,27 @@ func TestPublishChecks(t *testing.T) {
 To avoid leaking sensitive data,`})
 	})
 
+	t.Run("publish error environment", func(t *testing.T) {
+		res := c.RunDockerComposeCmdNoCheck(t, "-f", "./fixtures/publish/compose-environment.yml",
+			"-p", projectName, "publish", "test/test")
+		res.Assert(t, icmd.Expected{ExitCode: 1, Err: `service "serviceA" has literal environment variable "FOO".
+To avoid leaking sensitive data,`})
+	})
+
+	t.Run("publish success interpolated env", func(t *testing.T) {
+		res := c.RunDockerComposeCmd(t, "-f", "./fixtures/publish/compose-interpolated-env.yml",
+			"-p", projectName, "publish", "test/test", "-y", "--dry-run")
+		assert.Assert(t, strings.Contains(res.Combined(), "test/test publishing"), res.Combined())
+		assert.Assert(t, strings.Contains(res.Combined(), "test/test published"), res.Combined())
+	})
+
 	t.Run("publish multiple errors env_file and environment", func(t *testing.T) {
 		res := c.RunDockerComposeCmdNoCheck(t, "-f", "./fixtures/publish/compose-multi-env-config.yml",
 			"-p", projectName, "publish", "test/test")
 		// we don't in which order the services will be loaded, so we can't predict the order of the error messages
 		assert.Assert(t, strings.Contains(res.Combined(), `service "serviceB" has env_file declared.`), res.Combined())
+		assert.Assert(t, strings.Contains(res.Combined(), `service "serviceA" has literal environment variable "FOO".`), res.Combined())
+		assert.Assert(t, strings.Contains(res.Combined(), `service "serviceB" has literal environment variable "BAR".`), res.Combined())
 		assert.Assert(t, strings.Contains(res.Combined(), `To avoid leaking sensitive data, you must either explicitly allow the sending of environment variables by using the --with-env flag,
 or remove sensitive data from your Compose configuration
 `), res.Combined())

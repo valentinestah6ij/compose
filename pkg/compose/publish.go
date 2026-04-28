@@ -25,6 +25,8 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"regexp"
+	"slices"
 	"strings"
 
 	"github.com/DefangLabs/secret-detector/pkg/scanner"
@@ -341,35 +343,191 @@ func (s *composeService) preChecks(ctx context.Context, project *types.Project, 
 			return false, err
 		}
 	}
-	err = s.checkEnvironmentVariables(project, options)
+	err = s.checkEnvironmentVariables(ctx, project, options)
 	if err != nil {
 		return false, err
 	}
 	return true, nil
 }
 
-func (s *composeService) checkEnvironmentVariables(project *types.Project, options api.PublishOptions) error {
-	errorList := map[string][]string{}
+// serviceFindings tracks per-service evidence collected while walking
+// every compose file scheduled for publication.
+type serviceFindings struct {
+	hasEnvFiles bool
+	literalVars map[string]struct{}
+}
 
-	for _, service := range project.Services {
-		if len(service.EnvFiles) > 0 {
-			errorList[service.Name] = append(errorList[service.Name], fmt.Sprintf("service %q has env_file declared.", service.Name))
-		}
+// checkEnvironmentVariables walks every compose file that will be serialized
+// into the OCI artifact (the top-level files plus any local extends parents)
+// and flags services that contain hardcoded env_file declarations or literal
+// environment values. Interpolated values like "${SECRET}" are preserved as
+// placeholders in the published YAML and don't leak the resolved value, so
+// they are intentionally not flagged.
+func (s *composeService) checkEnvironmentVariables(ctx context.Context, project *types.Project, options api.PublishOptions) error {
+	if options.WithEnvironment || len(project.ComposeFiles) == 0 {
+		return nil
 	}
 
-	if !options.WithEnvironment && len(errorList) > 0 {
-		errorMsgSuffix := "To avoid leaking sensitive data, you must either explicitly allow the sending of environment variables by using the --with-env flag,\n" +
-			"or remove sensitive data from your Compose configuration"
-		var errorMsg strings.Builder
-		for _, errors := range errorList {
-			for _, err := range errors {
-				fmt.Fprintf(&errorMsg, "%s\n", err)
+	services, configsWithLiteralContent, err := collectEnvironmentFindings(ctx, project)
+	if err != nil {
+		return err
+	}
+
+	lines := buildEnvironmentErrorLines(services, configsWithLiteralContent)
+	if len(lines) == 0 {
+		return nil
+	}
+
+	var msg strings.Builder
+	for _, l := range lines {
+		fmt.Fprintf(&msg, "%s\n", l)
+	}
+	msg.WriteString("To avoid leaking sensitive data, you must either explicitly allow the sending of environment variables by using the --with-env flag,\n")
+	msg.WriteString("or remove sensitive data from your Compose configuration")
+	return errors.New(msg.String())
+}
+
+// collectEnvironmentFindings walks every compose file scheduled for
+// publication (top-level files plus any local extends parents discovered along
+// the way) and aggregates per-service and per-config findings. The walk order
+// mirrors processExtends so coverage matches what is actually serialized into
+// the OCI artifact.
+func collectEnvironmentFindings(ctx context.Context, project *types.Project) (map[string]*serviceFindings, map[string]struct{}, error) {
+	services := map[string]*serviceFindings{}
+	configsWithLiteralContent := map[string]struct{}{}
+
+	seen := map[string]struct{}{}
+	queue := slices.Clone(project.ComposeFiles)
+	for len(queue) > 0 {
+		file := queue[0]
+		queue = queue[1:]
+		if _, ok := seen[file]; ok {
+			continue
+		}
+		seen[file] = struct{}{}
+
+		unresolved, err := loadUnresolvedFile(ctx, project, file)
+		if err != nil {
+			return nil, nil, fmt.Errorf("failed to load compose file %s: %w", file, err)
+		}
+
+		for _, service := range unresolved.Services {
+			recordServiceFindings(services, service)
+			if parent := localExtendsParent(service); parent != "" {
+				queue = append(queue, parent)
 			}
 		}
-		return fmt.Errorf("%s%s", errorMsg.String(), errorMsgSuffix)
-
+		for _, config := range unresolved.Configs {
+			// config.Environment is a variable *name* (only the name is
+			// published, not its resolved value) so it is not a leak. Inline
+			// config.Content is what ends up in the artifact. compose-go
+			// enforces that file, environment, and content are mutually
+			// exclusive.
+			if config.Content != "" && !containsInterpolation(config.Content) {
+				configsWithLiteralContent[config.Name] = struct{}{}
+			}
+		}
 	}
-	return nil
+	return services, configsWithLiteralContent, nil
+}
+
+func recordServiceFindings(services map[string]*serviceFindings, service types.ServiceConfig) {
+	f := services[service.Name]
+	if f == nil {
+		f = &serviceFindings{literalVars: map[string]struct{}{}}
+		services[service.Name] = f
+	}
+	if len(service.EnvFiles) > 0 {
+		f.hasEnvFiles = true
+	}
+	for key, value := range service.Environment {
+		if value != nil && !containsInterpolation(*value) {
+			f.literalVars[key] = struct{}{}
+		}
+	}
+}
+
+// localExtendsParent returns the path of an extends parent file that exists on
+// disk, or "" when the service does not extend or extends a remote resource.
+func localExtendsParent(service types.ServiceConfig) string {
+	if service.Extends == nil || service.Extends.File == "" {
+		return ""
+	}
+	if _, err := os.Stat(service.Extends.File); err != nil {
+		return ""
+	}
+	return service.Extends.File
+}
+
+// buildEnvironmentErrorLines renders one human-readable line per finding,
+// aggregating multiple literal vars on the same service into a single line so
+// real configurations don't produce a wall of text.
+func buildEnvironmentErrorLines(services map[string]*serviceFindings, configsWithLiteralContent map[string]struct{}) []string {
+	var lines []string
+	for _, name := range sortedKeys(services) {
+		f := services[name]
+		if f.hasEnvFiles {
+			lines = append(lines, fmt.Sprintf("service %q has env_file declared.", name))
+		}
+		if len(f.literalVars) > 0 {
+			vars := sortedKeys(f.literalVars)
+			if len(vars) == 1 {
+				lines = append(lines, fmt.Sprintf("service %q has literal environment variable %q.", name, vars[0]))
+			} else {
+				quoted := make([]string, len(vars))
+				for i, v := range vars {
+					quoted[i] = fmt.Sprintf("%q", v)
+				}
+				lines = append(lines, fmt.Sprintf("service %q has literal environment variables: %s.", name, strings.Join(quoted, ", ")))
+			}
+		}
+	}
+	for _, name := range sortedKeys(configsWithLiteralContent) {
+		lines = append(lines, fmt.Sprintf("config %q has literal inline content.", name))
+	}
+	return lines
+}
+
+func sortedKeys[V any](m map[string]V) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	slices.Sort(keys)
+	return keys
+}
+
+// interpolationPattern matches compose-spec interpolation tokens: ${VAR},
+// ${VAR:-default}, $VAR, $_VAR. A `$$` escape is treated as containing
+// interpolation (the second `$` followed by a name still matches), which
+// keeps the heuristic simple and conservatively skips the value.
+var interpolationPattern = regexp.MustCompile(`\$([A-Za-z_]\w*|\{[^}]+\})`)
+
+func containsInterpolation(value string) bool {
+	return interpolationPattern.MatchString(value)
+}
+
+// loadUnresolvedFile loads a single compose file with interpolation and
+// environment resolution skipped, so callers can inspect raw user-provided
+// values. Used by both checkEnvironmentVariables and composeFileAsByteReader.
+func loadUnresolvedFile(ctx context.Context, project *types.Project, filePath string) (*types.Project, error) {
+	return loader.LoadWithContext(ctx, types.ConfigDetails{
+		WorkingDir:  project.WorkingDir,
+		Environment: project.Environment,
+		ConfigFiles: []types.ConfigFile{{Filename: filePath}},
+	}, func(options *loader.Options) {
+		options.SkipValidation = true
+		options.SkipExtends = true
+		options.SkipConsistencyCheck = true
+		options.ResolvePaths = true
+		// SkipInclude mirrors processFile: include directives stay symbolic in
+		// the published artifact, so included content must not be inspected
+		// here either (otherwise we'd flag literals that never ship).
+		options.SkipInclude = true
+		options.SkipInterpolation = true
+		options.SkipResolveEnvironment = true
+		options.Profiles = project.Profiles
+	})
 }
 
 func envFileLayers(files map[string]string) []v1.Descriptor {
@@ -473,31 +631,10 @@ func (s *composeService) checkForSensitiveData(ctx context.Context, project *typ
 }
 
 func composeFileAsByteReader(ctx context.Context, filePath string, project *types.Project) (io.Reader, error) {
-	composeFile, err := os.ReadFile(filePath)
+	base, err := loadUnresolvedFile(ctx, project, filePath)
 	if err != nil {
-		return nil, fmt.Errorf("failed to open compose file %s: %w", filePath, err)
+		return nil, fmt.Errorf("failed to load compose file %s: %w", filePath, err)
 	}
-	base, err := loader.LoadWithContext(ctx, types.ConfigDetails{
-		WorkingDir:  project.WorkingDir,
-		Environment: project.Environment,
-		ConfigFiles: []types.ConfigFile{
-			{
-				Filename: filePath,
-				Content:  composeFile,
-			},
-		},
-	}, func(options *loader.Options) {
-		options.SkipValidation = true
-		options.SkipExtends = true
-		options.SkipConsistencyCheck = true
-		options.ResolvePaths = true
-		options.SkipInterpolation = true
-		options.SkipResolveEnvironment = true
-	})
-	if err != nil {
-		return nil, err
-	}
-
 	in, err := base.MarshalYAML()
 	if err != nil {
 		return nil, err
